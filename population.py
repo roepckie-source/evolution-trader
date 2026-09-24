@@ -6,6 +6,7 @@ Population Engine
 Verwaltet die Population der Handelsstrategien.
 
 V1:
+
 - 96 Strategien
 - 24 pro Strategie-Familie
 - zufällige Generation 1
@@ -13,8 +14,11 @@ V1:
 - Crossover
 - Mutation
 - Random Injection
+- Fallback-Selektion, falls eine Generation
+  keine echten Survivors besitzt
 
 Wichtig:
+
 Dieses Modul entscheidet noch NICHT, welche Strategie
 wirtschaftlich gut ist.
 
@@ -25,6 +29,16 @@ Backtester
 Fitness
     ↓
 Population Evolution
+
+Wichtig zur Fallback-Selektion:
+
+Ein Fallback-Kandidat ist KEIN echter Survivor.
+
+Er darf nur als evolutionärer Elternteil verwendet werden,
+wenn eine Generation überhaupt keinen echten Survivor besitzt.
+
+Das verhindert, dass die Evolution komplett ausstirbt,
+ohne die eigentlichen Fitness-Gates aufzuweichen.
 """
 
 from __future__ import annotations
@@ -58,6 +72,14 @@ class Individual:
 
     strategy_id:
         Eindeutige Kennung.
+
+    survives:
+        True = echter Fitness-Survivor.
+
+        False = hat die normalen Hard-Gates nicht erfüllt.
+
+        Wichtig:
+        Fallback-Kandidaten werden NICHT auf True gesetzt.
     """
 
     genome: StrategyGenome
@@ -194,7 +216,9 @@ class Population:
             if individual.strategy_id == strategy_id:
 
                 individual.fitness = fitness
+
                 individual.survives = survives
+
                 individual.rejection_reason = (
                     rejection_reason
                 )
@@ -236,7 +260,11 @@ class Population:
         self,
     ) -> List[Individual]:
         """
-        Gibt nur überlebende Strategien zurück.
+        Gibt nur echte Fitness-Überlebende zurück.
+
+        Wichtig:
+
+        Fallback-Kandidaten werden hier NICHT zurückgegeben.
         """
 
         return [
@@ -244,6 +272,84 @@ class Population:
             for individual in self.individuals
             if individual.survives is True
         ]
+
+    # ========================================================
+    # EVOLUTION PARENTS
+    # ========================================================
+
+    def evolution_parents(
+        self,
+    ) -> List[Individual]:
+        """
+        Gibt die Kandidaten zurück, die für die Erzeugung
+        der nächsten Generation verwendet werden dürfen.
+
+        Normalfall:
+            echte Survivors
+
+        Fallback:
+            Wenn keine echten Survivors existieren,
+            werden die bestbewerteten Kandidaten verwendet.
+
+        Wichtig:
+
+        Die Fallback-Kandidaten werden NICHT zu echten
+        Survivors gemacht.
+
+        Damit bleiben die Fitness-Gates vollständig erhalten.
+        """
+
+        survivors = self.survivors()
+
+        if survivors:
+            return survivors
+
+        ranked = self.ranked()
+
+        evaluated = [
+            individual
+            for individual in ranked
+            if individual.fitness is not None
+        ]
+
+        if not evaluated:
+            raise RuntimeError(
+                "Keine bewerteten Strategien vorhanden. "
+                "Evolution kann nicht fortgesetzt werden."
+            )
+
+        # ----------------------------------------------------
+        # FALLBACK SIZE
+        # ----------------------------------------------------
+        #
+        # Wir verwenden maximal 20 % der Population,
+        # mindestens aber 4 Kandidaten.
+        #
+        # Bei 96 Strategien:
+        #
+        # 96 * 0.20 = 19.2
+        #
+        # => 19 Fallback-Eltern.
+        # ----------------------------------------------------
+
+        fallback_count = max(
+            4,
+            int(
+                len(self.individuals)
+                * 0.20
+            ),
+        )
+
+        fallback_count = min(
+            fallback_count,
+            len(evaluated),
+        )
+
+        fallback = evaluated[
+            :fallback_count
+        ]
+
+        return fallback
 
     # ========================================================
     # ELITE
@@ -254,7 +360,10 @@ class Population:
         count: Optional[int] = None,
     ) -> List[Individual]:
         """
-        Gibt die besten Überlebenden zurück.
+        Gibt die besten echten Überlebenden zurück.
+
+        Fallback-Kandidaten werden NICHT als Elite
+        betrachtet.
         """
 
         if count is None:
@@ -274,6 +383,41 @@ class Population:
         return survivors[:count]
 
     # ========================================================
+    # FALLBACK ELITE
+    # ========================================================
+
+    def fallback_elite(
+        self,
+        count: Optional[int] = None,
+    ) -> List[Individual]:
+        """
+        Gibt die besten Kandidaten für eine Fallback-
+        Evolution zurück.
+
+        Diese Strategien sind NICHT echte Survivors.
+        """
+
+        if count is None:
+            count = min(
+                config.ELITE_COUNT,
+                4,
+            )
+
+        parents = self.evolution_parents()
+
+        parents = sorted(
+            parents,
+            key=lambda individual: (
+                individual.fitness
+                if individual.fitness is not None
+                else -float("inf")
+            ),
+            reverse=True,
+        )
+
+        return parents[:count]
+
+    # ========================================================
     # SELECT PARENT
     # ========================================================
 
@@ -290,7 +434,7 @@ class Population:
         Die besten Strategien haben dadurch eine höhere
         Wahrscheinlichkeit, Eltern zu werden.
 
-        Gleichzeitig können schwächere Survivors noch
+        Gleichzeitig können schwächere Kandidaten noch
         ausgewählt werden.
         """
 
@@ -299,8 +443,13 @@ class Population:
                 "Keine Parent-Kandidaten."
             )
 
-        # Nur positive Fitnesswerte verwenden.
+        # ----------------------------------------------------
+        # FITNESS-GEWICHTE
+        # ----------------------------------------------------
+
         weights = []
+
+        minimum_weight = 0.01
 
         for candidate in candidates:
 
@@ -310,11 +459,28 @@ class Population:
                 else 0.0
             )
 
-            # Mindestgewicht verhindert, dass einzelne
-            # Strategien vollständig ausgeschlossen werden.
-            weights.append(
-                max(fitness, 0.01)
-            )
+            # ------------------------------------------------
+            # Negative Fitnesswerte können nicht sinnvoll
+            # als Gewicht verwendet werden.
+            #
+            # Alle Fallback-Kandidaten können z.B. -1000
+            # besitzen.
+            #
+            # Deshalb verwenden wir einen positiven Rang-
+            # basierten Anteil.
+            # ------------------------------------------------
+
+            if fitness <= 0:
+                weights.append(
+                    minimum_weight
+                )
+            else:
+                weights.append(
+                    max(
+                        fitness,
+                        minimum_weight,
+                    )
+                )
 
         return self.rng.choices(
             candidates,
@@ -385,8 +551,11 @@ class Population:
 
         else:
 
+            # ------------------------------------------------
             # Kein Crossover:
             # zufällig einen Elternteil klonen.
+            # ------------------------------------------------
+
             genome = (
                 parent_a.genome.copy()
                 if self.rng.random() < 0.5
@@ -423,26 +592,61 @@ class Population:
         """
         Erzeugt die nächste Generation.
 
-        Struktur:
+        Normalfall:
 
-        1. Elite direkt übernehmen
-        2. 8 Random Injection
-        3. Rest durch Crossover + Mutation
+        1. echte Elite übernehmen
+        2. Random Injection
+        3. Crossover + Mutation
+
+        Fallback:
+
+        Wenn keine echten Survivors existieren:
+
+        1. keine echte Elite
+        2. beste Fallback-Kandidaten klonen
+        3. Random Injection
+        4. Crossover + Mutation
+
+        Wichtig:
+
+        Die Fallback-Kandidaten bleiben als Objekte der
+        alten Generation gekennzeichnet.
+
+        Sie werden dadurch nicht automatisch zu Survivors.
         """
 
         survivors = self.survivors()
 
-        if not survivors:
+        using_fallback = not bool(
+            survivors
+        )
 
-            raise RuntimeError(
-                "Keine Survivor vorhanden. "
-                "Eine neue Generation kann nicht "
-                "aus toten Strategien gezüchtet werden."
+        # ----------------------------------------------------
+        # ELTERN BESTIMMEN
+        # ----------------------------------------------------
+
+        if using_fallback:
+
+            parents = self.evolution_parents()
+
+            elite = self.fallback_elite(
+                min(
+                    config.ELITE_COUNT,
+                    4,
+                )
             )
 
-        elite = self.elite(
-            config.ELITE_COUNT
-        )
+        else:
+
+            parents = survivors
+
+            elite = self.elite(
+                config.ELITE_COUNT
+            )
+
+        # ----------------------------------------------------
+        # NÄCHSTE POPULATION
+        # ----------------------------------------------------
 
         next_population = Population(
             generation=self.generation + 1,
@@ -454,7 +658,7 @@ class Population:
         ] = []
 
         # ----------------------------------------------------
-        # 1. ELITE
+        # 1. ELITE / FALLBACK ELITE
         # ----------------------------------------------------
 
         for index, individual in enumerate(
@@ -466,10 +670,19 @@ class Population:
                 individual.genome.copy()
             )
 
-            elite_id = (
-                f"G{self.generation + 1:03d}"
-                f"-E{index:03d}"
-            )
+            if using_fallback:
+
+                elite_id = (
+                    f"G{self.generation + 1:03d}"
+                    f"-F{index:03d}"
+                )
+
+            else:
+
+                elite_id = (
+                    f"G{self.generation + 1:03d}"
+                    f"-E{index:03d}"
+                )
 
             new_individuals.append(
                 Individual(
@@ -505,11 +718,11 @@ class Population:
         while len(new_individuals) < config.POPULATION_SIZE:
 
             parent_a = self.select_parent(
-                survivors
+                parents
             )
 
             parent_b = self.select_parent(
-                survivors
+                parents
             )
 
             child = self.create_child(
@@ -588,10 +801,12 @@ class Population:
         """Gibt eine Zusammenfassung aus."""
 
         print("=" * 70)
+
         print(
             f"POPULATION GENERATION "
             f"{self.generation}"
         )
+
         print("=" * 70)
 
         print(
@@ -627,6 +842,27 @@ class Population:
             f"{len(self.elite())}"
         )
 
+        # ----------------------------------------------------
+        # FALLBACK STATUS
+        # ----------------------------------------------------
+
+        if not self.survivors():
+
+            try:
+
+                fallback_count = len(
+                    self.evolution_parents()
+                )
+
+            except RuntimeError:
+
+                fallback_count = 0
+
+            print(
+                f"Fallback parents: "
+                f"{fallback_count}"
+            )
+
         print("=" * 70)
 
 
@@ -640,7 +876,9 @@ def self_test() -> None:
     """
 
     print("=" * 70)
-    print("EVOLUTION TRADER - POPULATION SELF TEST")
+    print(
+        "EVOLUTION TRADER - POPULATION SELF TEST"
+    )
     print("=" * 70)
 
     rng = Random(
@@ -665,6 +903,7 @@ def self_test() -> None:
     ) == config.POPULATION_SIZE
 
     print()
+
     print(
         f"PASS: Created "
         f"{len(individuals)} strategies"
@@ -820,13 +1059,132 @@ def self_test() -> None:
         "PASS: All child genomes valid"
     )
 
+    # ========================================================
+    # FALLBACK TEST
+    # ========================================================
+
+    print()
+    print(
+        "TEST: Zero-survivor fallback"
+    )
+
+    fallback_population = Population(
+        generation=1,
+        rng=Random(
+            config.RANDOM_SEED
+        ),
+    )
+
+    fallback_population.create_initial_population()
+
+    # --------------------------------------------------------
+    # Alle Strategien werden als NICHT überlebend markiert.
+    # --------------------------------------------------------
+
+    for index, individual in enumerate(
+        fallback_population.individuals
+    ):
+
+        # Unterschiedliche negative Fitnesswerte,
+        # damit das Ranking geprüft werden kann.
+        fitness = (
+            -1.0
+            - (index * 0.01)
+        )
+
+        fallback_population.set_fitness(
+            strategy_id=individual.strategy_id,
+            fitness=fitness,
+            survives=False,
+            rejection_reason="test_rejection",
+        )
+
+    # --------------------------------------------------------
+    # Es darf KEINE echten Survivors geben.
+    # --------------------------------------------------------
+
+    assert (
+        len(
+            fallback_population.survivors()
+        )
+        == 0
+    )
+
+    print(
+        "PASS: Zero real survivors"
+    )
+
+    # --------------------------------------------------------
+    # Fallback-Eltern müssen verfügbar sein.
+    # --------------------------------------------------------
+
+    fallback_parents = (
+        fallback_population.evolution_parents()
+    )
+
+    assert len(
+        fallback_parents
+    ) > 0
+
+    print(
+        f"PASS: "
+        f"{len(fallback_parents)} fallback parents"
+    )
+
+    # --------------------------------------------------------
+    # Nächste Generation muss trotzdem entstehen.
+    # --------------------------------------------------------
+
+    fallback_next = (
+        fallback_population.create_next_generation()
+    )
+
+    assert len(
+        fallback_next.individuals
+    ) == config.POPULATION_SIZE
+
+    print(
+        "PASS: Next generation created "
+        "with fallback"
+    )
+
+    # --------------------------------------------------------
+    # Generation muss 2 sein.
+    # --------------------------------------------------------
+
+    assert (
+        fallback_next.generation
+        == 2
+    )
+
+    print(
+        "PASS: Fallback generation increment"
+    )
+
+    # --------------------------------------------------------
+    # Alle neuen Genome müssen valide sein.
+    # --------------------------------------------------------
+
+    for individual in (
+        fallback_next.individuals
+    ):
+
+        individual.genome.validate()
+
+    print(
+        "PASS: Fallback genomes valid"
+    )
+
     print()
     print(
         "POPULATION SELF TEST PASSED"
     )
-
     print("=" * 70)
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
     self_test()

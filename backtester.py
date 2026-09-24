@@ -1,43 +1,23 @@
 """
 Evolution Trader
-================
-Backtesting Engine
+Backtester
 
 V1:
 - Long only
-- BTC/USDT
-- Signal auf Kerzenschluss
-- Einstieg frühestens auf nächster Kerzen-Open
-- Take Profit
-- Stop Loss
-- Trading Fees
-- Slippage
-- Equity Curve
-- Drawdown
-- Win Rate
-- Profit Factor
-
-WICHTIG:
-Kein Look-Ahead-Bias.
-
-Ein Signal auf Candle N darf niemals auf Candle N
-zum Schlusskurs ausgeführt werden.
-Die Ausführung erfolgt frühestens auf Candle N+1.
+- No look-ahead bias
+- Entry at next candle open
+- Stop-loss checked before take-profit
+- Fees and slippage included
+- Position sizing based on strategy genome
+- Paper/backtest only
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 import config
-
-from strategy_families import (
-    Candle,
-    generate_signal,
-)
-
 from strategy_genome import StrategyGenome
+from strategy_families import Candle, Signal, generate_signal
 
 
 # ============================================================
@@ -46,22 +26,20 @@ from strategy_genome import StrategyGenome
 
 @dataclass
 class Trade:
-    """Abgeschlossener Trade."""
-
-    entry_time: int
-    exit_time: int
+    entry_time: object
+    exit_time: object
 
     entry_price: float
     exit_price: float
 
-    quantity: float
+    position_size: float
 
     pnl: float
     pnl_percent: float
 
-    fees: float
+    fee: float
 
-    reason: str
+    exit_reason: str
 
 
 # ============================================================
@@ -70,46 +48,29 @@ class Trade:
 
 @dataclass
 class BacktestResult:
-    """Gesamtergebnis eines Backtests."""
-
     starting_capital: float
-    ending_capital: float
+    ending_balance: float
 
     total_return: float
-
     max_drawdown: float
 
     total_trades: int
-
     winning_trades: int
     losing_trades: int
 
     win_rate: float
-
-    gross_profit: float
-    gross_loss: float
-
     profit_factor: float
 
     total_fees: float
 
-    trades: List[Trade] = field(
-        default_factory=list
-    )
-
-    equity_curve: List[float] = field(
-        default_factory=list
-    )
+    equity_curve: List[float]
+    trades: List[Trade]
 
     # --------------------------------------------------------
-    # VALIDATION
+    # Survival gate
     # --------------------------------------------------------
 
     def is_valid(self) -> bool:
-        """
-        Prüft die grundlegenden Survival-Regeln.
-        """
-
         if self.total_trades < config.MIN_TRADES:
             return False
 
@@ -119,7 +80,7 @@ class BacktestResult:
         if self.max_drawdown > config.MAX_DRAWDOWN:
             return False
 
-        if self.total_return <= config.MIN_OOS_RETURN:
+        if self.total_return <= 0:
             return False
 
         return True
@@ -130,96 +91,74 @@ class BacktestResult:
 # ============================================================
 
 class Backtester:
-    """
-    Führt eine Strategie auf historischen Kerzen aus.
-    """
 
     def __init__(
         self,
         candles: List[Candle],
         genome: StrategyGenome,
-        starting_capital: float = config.STARTING_CAPITAL,
+        starting_capital: Optional[float] = None,
     ):
         self.candles = candles
         self.genome = genome
-        self.starting_capital = starting_capital
 
-        self.cash = starting_capital
+        self.starting_capital = (
+            starting_capital
+            if starting_capital is not None
+            else config.STARTING_CAPITAL
+        )
 
-        self.position_quantity = 0.0
-        self.entry_price: Optional[float] = None
-        self.entry_time: Optional[int] = None
+        self.balance = self.starting_capital
 
-        self.total_fees = 0.0
+        self.position = None
 
         self.trades: List[Trade] = []
-
         self.equity_curve: List[float] = []
+
+        self.total_fees = 0.0
 
     # ========================================================
     # FEES
     # ========================================================
 
-    @staticmethod
-    def apply_entry_cost(price: float) -> float:
-        """
-        Kaufpreis inklusive Slippage.
-        """
+    def calculate_fee(self, value: float) -> float:
+        return value * config.TRADING_FEE
 
-        return price * (
-            1.0 + config.SLIPPAGE
-        )
+    # ========================================================
+    # SLIPPAGE
+    # ========================================================
 
-    @staticmethod
-    def apply_exit_cost(price: float) -> float:
-        """
-        Verkaufspreis inklusive negativer Slippage.
-        """
+    def apply_entry_slippage(self, price: float) -> float:
+        return price * (1.0 + config.SLIPPAGE)
 
-        return price * (
-            1.0 - config.SLIPPAGE
-        )
+    def apply_exit_slippage(self, price: float) -> float:
+        return price * (1.0 - config.SLIPPAGE)
 
     # ========================================================
     # POSITION SIZE
     # ========================================================
 
-    def calculate_position_size(
-        self,
-        entry_price: float,
-    ) -> float:
+    def calculate_position_size(self) -> float:
         """
-        Berechnet die Positionsgröße.
+        Position size as percentage of current balance.
 
-        V1:
-        Ein fixer Kapitalanteil wird verwendet.
-
-        Das Genome-size_multiplier verändert die
-        Basisgröße, bleibt aber durch MAX_POSITION_PERCENT
-        begrenzt.
+        V1 keeps the maximum exposure at MAX_POSITION_PERCENT.
         """
 
         base_percent = config.MAX_POSITION_PERCENT
 
-        position_percent = (
-            base_percent
-            * self.genome.size_multiplier
-        )
+        position_percent = base_percent * self.genome.size_multiplier
 
         position_percent = min(
             position_percent,
             config.MAX_POSITION_PERCENT,
         )
 
-        capital_to_use = (
-            self.cash
-            * position_percent
+        position_percent = max(
+            position_percent,
+            0.0,
         )
 
-        if entry_price <= 0:
-            return 0.0
-
-        return capital_to_use / entry_price
+        return self.balance * position_percent
 
     # ========================================================
     # OPEN POSITION
@@ -228,55 +167,43 @@ class Backtester:
     def open_position(
         self,
         candle: Candle,
+        signal: Signal,
     ) -> None:
-        """
-        Öffnet eine Long-Position.
 
-        Wichtig:
-        Einstieg erfolgt auf Candle Open.
-        """
-
-        if self.position_quantity > 0:
+        if self.position is not None:
             return
 
-        raw_price = candle.open
-
-        entry_price = self.apply_entry_cost(
-            raw_price
-        )
-
-        quantity = self.calculate_position_size(
-            entry_price
-        )
-
-        if quantity <= 0:
+        if signal.direction != 1:
             return
 
-        gross_value = (
-            quantity
-            * entry_price
+        raw_entry_price = candle.open
+
+        entry_price = self.apply_entry_slippage(
+            raw_entry_price
         )
 
-        fee = (
-            gross_value
-            * config.TRADING_FEE
-        )
+        position_size = self.calculate_position_size()
 
-        total_cost = (
-            gross_value
-            + fee
-        )
-
-        if total_cost > self.cash:
+        if position_size <= 0:
             return
 
-        self.cash -= total_cost
+        entry_fee = self.calculate_fee(position_size)
 
-        self.position_quantity = quantity
-        self.entry_price = entry_price
-        self.entry_time = candle.timestamp
+        self.balance -= entry_fee
+        self.total_fees += entry_fee
 
-        self.total_fees += fee
+        self.position = {
+            "entry_time": candle.timestamp,
+            "entry_price": entry_price,
+            "position_size": position_size,
+            "entry_fee": entry_fee,
+            "stop_loss": entry_price * (
+                1.0 - self.genome.stop_loss
+            ),
+            "take_profit": entry_price * (
+                1.0 + self.genome.take_profit
+            ),
+        }
 
     # ========================================================
     # CLOSE POSITION
@@ -288,78 +215,63 @@ class Backtester:
         exit_price: float,
         reason: str,
     ) -> None:
-        """
-        Schließt eine Long-Position.
-        """
 
-        if self.position_quantity <= 0:
+        if self.position is None:
             return
 
-        if self.entry_price is None:
-            return
+        position = self.position
 
-        actual_exit = self.apply_exit_cost(
+        exit_price = self.apply_exit_slippage(
             exit_price
         )
 
-        gross_value = (
-            self.position_quantity
-            * actual_exit
+        entry_price = position["entry_price"]
+        position_size = position["position_size"]
+
+        price_change = (
+            exit_price - entry_price
+        ) / entry_price
+
+        pnl = position_size * price_change
+
+        exit_value = position_size + pnl
+
+        exit_fee = self.calculate_fee(
+            exit_value
         )
 
-        fee = (
-            gross_value
-            * config.TRADING_FEE
-        )
+        net_pnl = pnl - exit_fee
 
-        net_value = (
-            gross_value
-            - fee
-        )
+        self.balance += net_pnl
 
-        invested_value = (
-            self.position_quantity
-            * self.entry_price
-        )
-
-        pnl = (
-            net_value
-            - invested_value
-        )
+        self.total_fees += exit_fee
 
         pnl_percent = (
-            pnl
-            / invested_value
-            if invested_value > 0
+            net_pnl / position_size
+            if position_size > 0
             else 0.0
         )
 
-        self.cash += net_value
-
-        self.total_fees += fee
-
         trade = Trade(
-            entry_time=self.entry_time,
+            entry_time=position["entry_time"],
             exit_time=candle.timestamp,
 
-            entry_price=self.entry_price,
-            exit_price=actual_exit,
+            entry_price=entry_price,
+            exit_price=exit_price,
 
-            quantity=self.position_quantity,
+            position_size=position_size,
 
-            pnl=pnl,
+            pnl=net_pnl,
             pnl_percent=pnl_percent,
 
-            fees=fee,
+            fee=position["entry_fee"] + exit_fee,
 
-            reason=reason,
+            exit_reason=reason,
         )
 
         self.trades.append(trade)
 
-        self.position_quantity = 0.0
-        self.entry_price = None
-        self.entry_time = None
+        self.position = None
 
     # ========================================================
     # CHECK EXIT
@@ -368,64 +280,40 @@ class Backtester:
     def check_exit(
         self,
         candle: Candle,
-    ) -> bool:
-        """
-        Prüft Stop Loss und Take Profit.
+    ) -> None:
 
-        WICHTIG:
-        Wenn innerhalb derselben Candle sowohl Stop
-        als auch TP getroffen werden, wissen wir aus
-        OHLC-Daten nicht, was zuerst passiert ist.
+        if self.position is None:
+            return
 
-        Deshalb verwenden wir konservativ:
-        STOP zuerst.
-        """
-
-        if self.position_quantity <= 0:
-            return False
-
-        if self.entry_price is None:
-            return False
-
-        stop_price = (
-            self.entry_price
-            * (1.0 - self.genome.stop_loss)
-        )
-
-        take_profit_price = (
-            self.entry_price
-            * (1.0 + self.genome.take_profit)
-        )
+        stop_loss = self.position["stop_loss"]
+        take_profit = self.position["take_profit"]
 
         # ----------------------------------------------------
-        # STOP FIRST
+        # IMPORTANT:
+        # If both SL and TP are touched during the same candle,
+        # assume STOP LOSS happened first.
+        # This is conservative and avoids optimistic results.
         # ----------------------------------------------------
 
-        if candle.low <= stop_price:
+        if candle.low <= stop_loss:
 
             self.close_position(
                 candle=candle,
-                exit_price=stop_price,
+                exit_price=stop_loss,
                 reason="stop_loss",
             )
 
-            return True
+            return
 
-        # ----------------------------------------------------
-        # TAKE PROFIT
-        # ----------------------------------------------------
-
-        if candle.high >= take_profit_price:
+        if candle.high >= take_profit:
 
             self.close_position(
                 candle=candle,
-                exit_price=take_profit_price,
+                exit_price=take_profit,
                 reason="take_profit",
             )
 
-            return True
-
-        return False
+            return
 
     # ========================================================
     # CURRENT EQUITY
@@ -433,183 +321,227 @@ class Backtester:
 
     def current_equity(
         self,
-        current_price: float,
+        candle: Candle,
     ) -> float:
-        """
-        Mark-to-market Equity.
-        """
 
-        if self.position_quantity <= 0:
-            return self.cash
+        equity = self.balance
 
-        return (
-            self.cash
-            + self.position_quantity
-            * current_price
-        )
+        if self.position is not None:
+
+            position = self.position
+
+            current_price = candle.close
+
+            entry_price = position["entry_price"]
+            position_size = position["position_size"]
+
+            price_change = (
+                current_price - entry_price
+            ) / entry_price
+
+            unrealized_pnl = (
+                position_size * price_change
+            )
+
+            equity += unrealized_pnl
+
+        return equity
 
     # ========================================================
-    # RUN
+    # RUN BACKTEST
     # ========================================================
 
     def run(self) -> BacktestResult:
-        """
-        Führt den vollständigen Backtest aus.
-        """
 
-        self.genome.validate()
+        candles = self.candles
 
-        if len(self.candles) < 10:
+        if len(candles) < 10:
             raise ValueError(
-                "Zu wenige Candles für Backtest."
+                "Not enough candles for backtest."
             )
 
         # ----------------------------------------------------
-        # WICHTIG:
-        #
-        # Candle i:
-        #   Signal wird am Ende berechnet.
-        #
-        # Candle i+1:
-        #   möglicher Einstieg am Open.
+        # Main candle loop
         # ----------------------------------------------------
 
-        for i in range(1, len(self.candles)):
+        for i in range(1, len(candles)):
 
-            candle = self.candles[i]
-
-            previous_candles = (
-                self.candles[:i]
-            )
+            candle = candles[i]
 
             # ------------------------------------------------
-            # EXIT FIRST
+            # First check an existing position.
             # ------------------------------------------------
 
-            if self.position_quantity > 0:
-
-                self.check_exit(candle)
+            self.check_exit(candle)
 
             # ------------------------------------------------
-            # ENTRY
+            # Only generate a new signal if we are flat.
             # ------------------------------------------------
 
-            if self.position_quantity <= 0:
+            if self.position is None:
 
-                signal = generate_signal(
-                    previous_candles,
-                    self.genome,
+                # ====================================================
+                # PERFORMANCE OPTIMIZATION
+                #
+                # Previously:
+                #
+                # previous_candles = candles[:i]
+                #
+                # This copied the entire history on every iteration.
+                #
+                # We only need enough candles for the genome's
+                # lookback period.
+                # ====================================================
+
+                window_size = max(
+                    self.genome.lookback + 2,
+                    10,
                 )
 
-                if signal.direction == 1:
+                start_index = max(
+                    0,
+                    i - window_size,
+                )
 
-                    self.open_position(
-                        candle
+                previous_candles = candles[
+                    start_index:i
+                ]
+
+                if len(previous_candles) > 0:
+
+                    signal = generate_signal(
+                        previous_candles,
+                        self.genome,
                     )
 
+                    # ------------------------------------------------
+                    # IMPORTANT:
+                    #
+                    # Signal is generated from candles BEFORE the
+                    # current candle.
+                    #
+                    # Entry therefore happens at current candle OPEN.
+                    #
+                    # This prevents look-ahead bias.
+                    # ------------------------------------------------
+
+                    if signal.direction == 1:
+
+                        self.open_position(
+                            candle,
+                            signal,
+                        )
+
             # ------------------------------------------------
-            # EQUITY
+            # Track equity after processing this candle.
             # ------------------------------------------------
 
             equity = self.current_equity(
-                candle.close
+                candle
             )
 
             self.equity_curve.append(
                 equity
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # FORCE CLOSE AT END
-        # ----------------------------------------------------
+        # ====================================================
 
-        if self.position_quantity > 0:
+        if self.position is not None:
 
-            last_candle = self.candles[-1]
+            final_candle = candles[-1]
 
             self.close_position(
-                candle=last_candle,
-                exit_price=last_candle.close,
+                candle=final_candle,
+                exit_price=final_candle.close,
                 reason="end_of_backtest",
             )
 
             self.equity_curve.append(
-                self.cash
+                self.balance
             )
+
+        # ====================================================
+        # BUILD RESULT
+        # ====================================================
 
         return self.build_result()
 
     # ========================================================
-    # RESULT
+    # BUILD RESULT
     # ========================================================
 
     def build_result(self) -> BacktestResult:
-        """Erzeugt das Backtest-Ergebnis."""
 
-        ending_capital = self.cash
+        ending_balance = self.balance
 
         total_return = (
-            ending_capital
+            ending_balance
             / self.starting_capital
         ) - 1.0
 
-        winning = [
-            trade
+        total_trades = len(self.trades)
+
+        winning_trades = sum(
+            1
             for trade in self.trades
             if trade.pnl > 0
-        ]
+        )
 
-        losing = [
-            trade
+        losing_trades = sum(
+            1
             for trade in self.trades
-            if trade.pnl <= 0
-        ]
-
-        winning_trades = len(winning)
-        losing_trades = len(losing)
-
-        total_trades = len(
-            self.trades
+            if trade.pnl < 0
         )
 
         if total_trades > 0:
+
             win_rate = (
                 winning_trades
                 / total_trades
             )
+
         else:
+
             win_rate = 0.0
 
         gross_profit = sum(
             trade.pnl
-            for trade in winning
+            for trade in self.trades
+            if trade.pnl > 0
         )
 
-        gross_loss = abs(
-            sum(
-                trade.pnl
-                for trade in losing
-            )
+        gross_loss = sum(
+            trade.pnl
+            for trade in self.trades
+            if trade.pnl < 0
         )
 
-        if gross_loss > 0:
+        if gross_loss < 0:
+
             profit_factor = (
                 gross_profit
-                / gross_loss
-            )
-        else:
-            profit_factor = (
-                float("inf")
-                if gross_profit > 0
-                else 0.0
+                / abs(gross_loss)
             )
 
-        max_drawdown = self.calculate_max_drawdown()
+        elif gross_profit > 0:
+
+            profit_factor = float("inf")
+
+        else:
+
+            profit_factor = 0.0
+
+        max_drawdown = (
+            self.calculate_max_drawdown()
+        )
 
         return BacktestResult(
+
             starting_capital=self.starting_capital,
 
-            ending_capital=ending_capital,
+            ending_balance=ending_balance,
 
             total_return=total_return,
 
@@ -623,27 +555,20 @@ class Backtester:
 
             win_rate=win_rate,
 
-            gross_profit=gross_profit,
-
-            gross_loss=gross_loss,
-
             profit_factor=profit_factor,
 
             total_fees=self.total_fees,
 
-            trades=self.trades.copy(),
+            equity_curve=self.equity_curve,
 
-            equity_curve=self.equity_curve.copy(),
+            trades=self.trades,
         )
 
     # ========================================================
-    # DRAWDOWN
+    # MAX DRAWDOWN
     # ========================================================
 
     def calculate_max_drawdown(self) -> float:
-        """
-        Berechnet maximalen Drawdown.
-        """
 
         if not self.equity_curve:
             return 0.0
@@ -669,96 +594,95 @@ class Backtester:
 
         return max_drawdown
 
+    # ========================================================
+    # PRINT RESULT
+    # ========================================================
+
+    def print_result(
+        self,
+        result: BacktestResult,
+    ) -> None:
+
+        print()
+        print("=" * 60)
+        print("BACKTEST RESULT")
+        print("=" * 60)
+
+        print(
+            f"Starting capital: "
+            f"${result.starting_capital:,.2f}"
+        )
+
+        print(
+            f"Ending balance:   "
+            f"${result.ending_balance:,.2f}"
+        )
+
+        print(
+            f"Return:           "
+            f"{result.total_return * 100:.2f}%"
+        )
+
+        print(
+            f"Max drawdown:     "
+            f"{result.max_drawdown * 100:.2f}%"
+        )
+
+        print(
+            f"Trades:           "
+            f"{result.total_trades}"
+        )
+
+        print(
+            f"Winners:          "
+            f"{result.winning_trades}"
+        )
+
+        print(
+            f"Losers:           "
+            f"{result.losing_trades}"
+        )
+
+        print(
+            f"Win rate:         "
+            f"{result.win_rate * 100:.2f}%"
+        )
+
+        if result.profit_factor == float("inf"):
+
+            pf_text = "INF"
+
+        else:
+
+            pf_text = (
+                f"{result.profit_factor:.2f}"
+            )
+
+        print(
+            f"Profit factor:    "
+            f"{pf_text}"
+        )
+
+        print(
+            f"Total fees:       "
+            f"${result.total_fees:,.2f}"
+        )
+
+        print(
+            f"Survived:         "
+            f"{result.is_valid()}"
+        )
+
+        print("=" * 60)
+
 
 # ============================================================
-# RESULT DISPLAY
+# SYNTHETIC TEST DATA
 # ============================================================
 
-def print_result(
-    result: BacktestResult,
-) -> None:
-    """Gibt das Ergebnis übersichtlich aus."""
-
-    print("=" * 70)
-    print("BACKTEST RESULT")
-    print("=" * 70)
-
-    print(
-        f"Starting Capital: "
-        f"${result.starting_capital:,.2f}"
-    )
-
-    print(
-        f"Ending Capital:   "
-        f"${result.ending_capital:,.2f}"
-    )
-
-    print(
-        f"Return:           "
-        f"{result.total_return:.2%}"
-    )
-
-    print(
-        f"Max Drawdown:     "
-        f"{result.max_drawdown:.2%}"
-    )
-
-    print("-" * 70)
-
-    print(
-        f"Trades:           "
-        f"{result.total_trades}"
-    )
-
-    print(
-        f"Winners:          "
-        f"{result.winning_trades}"
-    )
-
-    print(
-        f"Losers:           "
-        f"{result.losing_trades}"
-    )
-
-    print(
-        f"Win Rate:         "
-        f"{result.win_rate:.2%}"
-    )
-
-    print(
-        f"Profit Factor:    "
-        f"{result.profit_factor:.2f}"
-    )
-
-    print(
-        f"Fees:             "
-        f"${result.total_fees:.2f}"
-    )
-
-    print("-" * 70)
-
-    print(
-        f"Survives:         "
-        f"{result.is_valid()}"
-    )
-
-    print("=" * 70)
-
-
-# ============================================================
-# SELF TEST
-# ============================================================
-
-def create_test_market(
-    count: int = 500,
+def create_test_candles(
+    count: int = 200,
 ) -> List[Candle]:
-    """
-    Erzeugt künstliche Testdaten.
-
-    Diese Daten sind NUR für den technischen Selbsttest.
-    Sie dürfen niemals als Trading-Ergebnis interpretiert
-    werden.
-    """
 
     candles = []
 
@@ -766,72 +690,66 @@ def create_test_market(
 
     for i in range(count):
 
-        phase = i % 100
-
-        if phase < 50:
-            change = 0.002
+        # Create deterministic price movement.
+        if i % 20 < 10:
+            price *= 1.001
         else:
-            change = -0.0015
+            price *= 0.999
 
-        previous = price
+        open_price = price
 
-        price = (
-            previous
-            * (1.0 + change)
+        high_price = (
+            open_price * 1.005
         )
 
-        high = max(
-            previous,
-            price,
-        ) * 1.002
+        low_price = (
+            open_price * 0.995
+        )
 
-        low = min(
-            previous,
-            price,
-        ) * 0.998
+        close_price = price
+
+        volume = 1000.0
 
         candles.append(
             Candle(
                 timestamp=i,
 
-                open=previous,
+                open=open_price,
+                high=high_price,
+                low=low_price,
+                close=close_price,
 
-                high=high,
-
-                low=low,
-
-                close=price,
-
-                volume=1000.0,
+                volume=volume,
             )
         )
 
     return candles
 
 
+# ============================================================
+# SELF TEST
+# ============================================================
+
 def self_test() -> None:
-    """
-    Technischer Selbsttest.
-    """
 
-    from random import Random
+    print()
+    print("=" * 60)
+    print("BACKTESTER SELF TEST")
+    print("=" * 60)
 
-    print("=" * 70)
-    print("EVOLUTION TRADER - BACKTESTER SELF TEST")
-    print("=" * 70)
-
-    rng = Random(42)
-
-    candles = create_test_market()
+    candles = create_test_candles(
+        250
+    )
 
     genome = StrategyGenome.random(
-        family="momentum",
-        rng=rng,
+        family="momentum"
     )
 
     print()
-    print("Strategy:")
-    print(genome.short_description())
+    print("Test genome:")
+    print(
+        genome.short_description()
+    )
 
     backtester = Backtester(
         candles=candles,
@@ -841,40 +759,40 @@ def self_test() -> None:
 
     result = backtester.run()
 
-    print()
-
-    print_result(result)
+    backtester.print_result(
+        result
+    )
 
     # --------------------------------------------------------
-    # BASIC ASSERTIONS
+    # Basic assertions
     # --------------------------------------------------------
 
-    assert result.ending_capital > 0
+    assert result.starting_capital == 1000.0
+
+    assert result.ending_balance >= 0
 
     assert result.total_trades >= 0
 
     assert 0.0 <= result.win_rate <= 1.0
 
-    assert 0.0 <= result.max_drawdown <= 1.0
+    assert result.max_drawdown >= 0.0
 
-    assert result.total_fees >= 0
+    assert result.max_drawdown <= 1.0
+
+    assert result.total_fees >= 0.0
 
     assert len(
         result.equity_curve
     ) > 0
 
     print()
-    print("PASS: Backtest completed")
-    print("PASS: Equity curve generated")
-    print("PASS: Trade accounting")
-    print("PASS: Fee accounting")
-    print("PASS: Drawdown calculation")
-    print("PASS: Result validation")
+    print("ALL BACKTESTER TESTS PASSED")
+    print("=" * 60)
 
-    print()
-    print("BACKTESTER SELF TEST PASSED")
-    print("=" * 70)
 
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
     self_test()

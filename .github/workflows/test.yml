@@ -1,1 +1,36 @@
+name: Evolution Trader Tests
 
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run genome test
+        run: |
+          python strategy_genome.py
+
+      - name: Run strategy family test
+        run: |
+          python strategy_families.py
+
+      - name: Run backtester test
+        run: |
+          python backtester.py
+
+      - name: Run market data test
+        run: |
+          python market_data.py

@@ -80,7 +80,7 @@ class OOSResult:
 
 def load_market_data() -> list:
     """
-    Load existing 30-day CSV if available.
+    Load existing CSV if available.
 
     If no CSV exists, download 30 days from Coinbase,
     validate them and save them to CSV.
@@ -249,6 +249,16 @@ def evolve_on_train(
     Run the evolutionary process ONLY on TRAIN data.
 
     OOS data is not available here.
+
+    IMPORTANT:
+    If a generation has zero real survivors, the population
+    is NOT stopped. Population.create_next_generation()
+    contains a fallback mechanism that uses the best-ranked
+    evaluated candidates as temporary evolutionary parents.
+
+    These fallback candidates are NOT marked as real survivors
+    and therefore cannot enter the final OOS test unless they
+    independently pass the TRAIN fitness gates later.
     """
 
     print()
@@ -387,7 +397,7 @@ def evolve_on_train(
         )
 
         print(
-            f"Survivors:  "
+            f"Real Survivors: "
             f"{len(survivors)}"
         )
 
@@ -410,21 +420,56 @@ def evolve_on_train(
                 f"{best.fitness:.4f}"
             )
 
-        print("=" * 70)
+            if not survivors:
 
-        # ----------------------------------------------------
-        # STOP IF NOTHING SURVIVES
-        # ----------------------------------------------------
+                print()
+                print(
+                    "NO REAL TRAIN SURVIVORS."
+                )
 
-        if not survivors:
+                print(
+                    "Fallback evolution will continue."
+                )
+
+                print(
+                    "The best-ranked TRAIN candidates "
+                    "will be used as temporary parents."
+                )
+
+        else:
 
             print()
             print(
-                "NO TRAIN SURVIVORS."
+                "WARNING: Population ranking is empty."
+            )
+
+        print("=" * 70)
+
+        # ----------------------------------------------------
+        # FINAL GENERATION
+        # ----------------------------------------------------
+        #
+        # The final TRAIN population must remain frozen.
+        #
+        # Only after the final generation has been evaluated
+        # will real TRAIN survivors be passed to OOS.
+        #
+        # ----------------------------------------------------
+
+        if generation == EVOLUTION_GENERATIONS:
+
+            print()
+            print(
+                "FINAL TRAIN GENERATION REACHED."
             )
 
             print(
-                "Evolution stopped."
+                f"Frozen real TRAIN survivors: "
+                f"{len(survivors)}"
+            )
+
+            print(
+                "TRAIN evolution is now complete."
             )
 
             break
@@ -432,12 +477,51 @@ def evolve_on_train(
         # ----------------------------------------------------
         # CREATE NEXT GENERATION
         # ----------------------------------------------------
+        #
+        # IMPORTANT:
+        #
+        # We deliberately call create_next_generation()
+        # even when there are zero real survivors.
+        #
+        # population.py contains the fallback mechanism.
+        #
+        # This allows the evolutionary process to continue
+        # instead of stopping after Generation 1.
+        #
+        # ----------------------------------------------------
 
-        if generation < EVOLUTION_GENERATIONS:
+        print()
+        print(
+            f"Creating TRAIN generation "
+            f"{generation + 1}..."
+        )
 
-            population = (
-                population.create_next_generation()
+        if survivors:
+
+            print(
+                f"Using {len(survivors)} real TRAIN survivors "
+                f"as evolutionary parents."
             )
+
+        else:
+
+            print(
+                "No real survivors available."
+            )
+
+            print(
+                "Using fallback-ranked TRAIN candidates "
+                "for evolutionary parent selection."
+            )
+
+        population = (
+            population.create_next_generation()
+        )
+
+        print(
+            f"Next generation created: "
+            f"{len(population.individuals)} strategies"
+        )
 
     return population
 
@@ -497,6 +581,10 @@ def evaluate_oos(
     # IMPORTANT:
     #
     # Only TRAIN survivors are allowed into OOS.
+    #
+    # Fallback candidates are deliberately excluded because
+    # population.survivors() only returns candidates that
+    # actually passed the TRAIN fitness gates.
     # --------------------------------------------------------
 
     candidates = population.survivors()
@@ -720,6 +808,17 @@ def print_oos_report(
 
         print(
             "Therefore no OOS test was possible."
+        )
+
+        print()
+
+        print(
+            "IMPORTANT:"
+        )
+
+        print(
+            "The evolutionary process still completed "
+            "all configured TRAIN generations."
         )
 
         return

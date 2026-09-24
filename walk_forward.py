@@ -6,21 +6,22 @@ V1
 
 Workflow:
 
-1. Load historical BTC 5m data
-2. Split chronologically into:
+1. Load 30 days of BTC/USD 5m data
+2. Split chronologically:
        70% TRAIN
        30% OOS
-3. Evolve strategies ONLY on TRAIN data
-4. Freeze the final TRAIN population
-5. Evaluate the frozen population on OOS data
-6. Report TRAIN vs OOS results
+3. Evolve strategies ONLY on TRAIN
+4. Freeze final TRAIN population
+5. Test TRAIN survivors on OOS
+6. Report OOS survival
 
 IMPORTANT:
-- OOS data is never used during evolution
-- OOS data does not influence mutation
-- OOS data does not influence parent selection
-- OOS data does not influence fitness
-- No live trading
+- OOS data is NEVER used during evolution
+- OOS data does NOT influence fitness
+- OOS data does NOT influence mutation
+- OOS data does NOT influence crossover
+- OOS data does NOT influence parent selection
+- NO live trading
 """
 
 from dataclasses import dataclass
@@ -30,7 +31,12 @@ import config
 
 from backtester import Backtester
 from fitness import calculate_fitness
-from market_data import load_candles
+from market_data import (
+    download_history,
+    save_csv,
+    load_csv,
+    validate_data,
+)
 from population import Population, Individual
 
 
@@ -38,12 +44,12 @@ from population import Population, Individual
 # SETTINGS
 # ============================================================
 
+DATA_DAYS = 30
+
 TRAIN_PERCENT = 0.70
 OOS_PERCENT = 0.30
 
 EVOLUTION_GENERATIONS = 3
-
-MIN_OOS_RETURN = config.MIN_OOS_RETURN
 
 
 # ============================================================
@@ -56,11 +62,6 @@ class OOSResult:
     family: str
 
     train_fitness: float
-    train_return: float
-    train_drawdown: float
-    train_win_rate: float
-    train_profit_factor: float
-    train_trades: int
 
     oos_return: float
     oos_drawdown: float
@@ -70,50 +71,153 @@ class OOSResult:
 
     oos_survives: bool
 
+    rejection_reason: str
+
 
 # ============================================================
-# DATA SPLIT
+# LOAD MARKET DATA
+# ============================================================
+
+def load_market_data() -> list:
+    """
+    Load existing 30-day CSV if available.
+
+    If no CSV exists, download 30 days from Coinbase,
+    validate them and save them to CSV.
+    """
+
+    try:
+
+        print()
+        print("=" * 70)
+        print("LOADING MARKET DATA")
+        print("=" * 70)
+
+        candles = load_csv()
+
+        print(
+            f"Existing CSV found: "
+            f"{len(candles)} candles"
+        )
+
+        validate_data(candles)
+
+        # ----------------------------------------------------
+        # We need enough data for the configured test.
+        # ----------------------------------------------------
+
+        minimum_required = 100
+
+        if len(candles) < minimum_required:
+
+            print(
+                "CSV contains too few candles."
+            )
+
+            print(
+                "Downloading fresh 30-day dataset..."
+            )
+
+            candles = download_history(
+                days=DATA_DAYS
+            )
+
+            validate_data(candles)
+
+            save_csv(candles)
+
+        return candles
+
+    except FileNotFoundError:
+
+        print(
+            "No market-data CSV found."
+        )
+
+        print(
+            f"Downloading {DATA_DAYS} days..."
+        )
+
+        candles = download_history(
+            days=DATA_DAYS
+        )
+
+        validate_data(candles)
+
+        save_csv(candles)
+
+        return candles
+
+
+# ============================================================
+# SPLIT DATA
 # ============================================================
 
 def split_data(
-    candles,
+    candles: list,
 ) -> Tuple[list, list]:
+    """
+    Chronological 70/30 split.
 
-    if len(candles) < 100:
+    TRAIN:
+        first 70%
+
+    OOS:
+        final 30%
+
+    No shuffling.
+    """
+
+    if not candles:
+
         raise ValueError(
-            "Not enough candles for train/OOS split."
+            "No market data available."
         )
 
     split_index = int(
         len(candles) * TRAIN_PERCENT
     )
 
-    train = candles[:split_index]
-    oos = candles[split_index:]
+    if split_index <= 0:
 
-    if not train:
         raise ValueError(
             "TRAIN dataset is empty."
         )
 
-    if not oos:
+    if split_index >= len(candles):
+
         raise ValueError(
             "OOS dataset is empty."
         )
 
-    return train, oos
+    train_candles = candles[
+        :split_index
+    ]
+
+    oos_candles = candles[
+        split_index:
+    ]
+
+    return (
+        train_candles,
+        oos_candles,
+    )
 
 
 # ============================================================
-# EVALUATE ONE STRATEGY
+# EVALUATE STRATEGY
 # ============================================================
 
 def evaluate_strategy(
     individual: Individual,
-    candles,
+    candles: list,
 ):
     """
-    Run one genome through the backtester.
+    Backtest one strategy.
+
+    Returns:
+        backtest result
+        fitness result
     """
 
     backtester = Backtester(
@@ -128,7 +232,10 @@ def evaluate_strategy(
         result
     )
 
-    return result, fitness_result
+    return (
+        result,
+        fitness_result,
+    )
 
 
 # ============================================================
@@ -136,8 +243,13 @@ def evaluate_strategy(
 # ============================================================
 
 def evolve_on_train(
-    train_candles,
+    train_candles: list,
 ) -> Population:
+    """
+    Run the evolutionary process ONLY on TRAIN data.
+
+    OOS data is not available here.
+    """
 
     print()
     print("=" * 70)
@@ -145,24 +257,33 @@ def evolve_on_train(
     print("=" * 70)
 
     print(
-        f"TRAIN candles: {len(train_candles)}"
+        f"TRAIN candles: "
+        f"{len(train_candles)}"
     )
 
     print(
-        f"Generations:   {EVOLUTION_GENERATIONS}"
+        f"Population:    "
+        f"{config.POPULATION_SIZE}"
     )
 
     print(
-        f"Population:    {config.POPULATION_SIZE}"
+        f"Generations:   "
+        f"{EVOLUTION_GENERATIONS}"
     )
 
     print()
 
-    population = Population(
-        generation=1
-    )
+    # --------------------------------------------------------
+    # INITIAL POPULATION
+    # --------------------------------------------------------
+
+    population = Population()
 
     population.create_initial_population()
+
+    # ========================================================
+    # GENERATIONS
+    # ========================================================
 
     for generation in range(
         1,
@@ -171,15 +292,22 @@ def evolve_on_train(
 
         print()
         print("#" * 70)
+
         print(
             f"TRAIN GENERATION "
-            f"{generation}/{EVOLUTION_GENERATIONS}"
+            f"{generation}/"
+            f"{EVOLUTION_GENERATIONS}"
         )
+
         print("#" * 70)
 
         # ----------------------------------------------------
-        # Evaluate population
+        # EVALUATE ALL STRATEGIES
         # ----------------------------------------------------
+
+        total = len(
+            population.individuals
+        )
 
         for index, individual in enumerate(
             population.individuals,
@@ -200,9 +328,26 @@ def evolve_on_train(
                 fitness_result.rejection_reason,
             )
 
+            if result.profit_factor == float(
+                "inf"
+            ):
+
+                pf_text = "INF"
+
+            else:
+
+                pf_text = (
+                    f"{result.profit_factor:.2f}"
+                )
+
+            status = (
+                "SURVIVES"
+                if fitness_result.survives
+                else "DEAD"
+            )
+
             print(
-                f"[{index:03d}/"
-                f"{len(population.individuals):03d}] "
+                f"[{index:03d}/{total:03d}] "
                 f"{individual.strategy_id:<12} "
                 f"{individual.genome.family:<22} "
                 f"Return="
@@ -212,14 +357,14 @@ def evolve_on_train(
                 f"WR="
                 f"{result.win_rate * 100:6.2f}% "
                 f"PF="
-                f"{result.profit_factor:6.2f} "
+                f"{pf_text:>6} "
                 f"Fitness="
                 f"{fitness_result.score:8.3f} "
-                f"{'SURVIVES' if fitness_result.survives else 'DEAD'}"
+                f"{status}"
             )
 
         # ----------------------------------------------------
-        # Summary
+        # SUMMARY
         # ----------------------------------------------------
 
         ranked = population.ranked()
@@ -228,10 +373,12 @@ def evolve_on_train(
 
         print()
         print("=" * 70)
+
         print(
             f"TRAIN GENERATION "
             f"{generation} SUMMARY"
         )
+
         print("=" * 70)
 
         print(
@@ -266,14 +413,14 @@ def evolve_on_train(
         print("=" * 70)
 
         # ----------------------------------------------------
-        # No survivors
+        # STOP IF NOTHING SURVIVES
         # ----------------------------------------------------
 
         if not survivors:
 
             print()
             print(
-                "NO SURVIVING STRATEGIES."
+                "NO TRAIN SURVIVORS."
             )
 
             print(
@@ -283,7 +430,7 @@ def evolve_on_train(
             break
 
         # ----------------------------------------------------
-        # Create next generation
+        # CREATE NEXT GENERATION
         # ----------------------------------------------------
 
         if generation < EVOLUTION_GENERATIONS:
@@ -296,13 +443,21 @@ def evolve_on_train(
 
 
 # ============================================================
-# OOS EVALUATION
+# OOS TEST
 # ============================================================
 
 def evaluate_oos(
     population: Population,
-    oos_candles,
+    oos_candles: list,
 ) -> List[OOSResult]:
+    """
+    Evaluate frozen TRAIN survivors on OOS.
+
+    IMPORTANT:
+
+    OOS results are NEVER fed back into the
+    evolutionary process.
+    """
 
     print()
     print("=" * 70)
@@ -315,13 +470,9 @@ def evaluate_oos(
     )
 
     print()
-    print(
-        "IMPORTANT:"
-    )
 
     print(
-        "The OOS results are NOT used "
-        "to modify the population."
+        "TRAIN population is now FROZEN."
     )
 
     print(
@@ -336,12 +487,16 @@ def evaluate_oos(
         "No parent selection."
     )
 
+    print(
+        "No evolution using OOS results."
+    )
+
     print()
 
     # --------------------------------------------------------
-    # Use TRAIN survivors only.
+    # IMPORTANT:
     #
-    # We deliberately do not select the best OOS strategy.
+    # Only TRAIN survivors are allowed into OOS.
     # --------------------------------------------------------
 
     candidates = population.survivors()
@@ -355,14 +510,14 @@ def evaluate_oos(
 
     results: List[OOSResult] = []
 
+    # ========================================================
+    # TEST EACH FROZEN STRATEGY
+    # ========================================================
+
     for index, individual in enumerate(
         candidates,
         start=1,
     ):
-
-        # ----------------------------------------------------
-        # Backtest OOS
-        # ----------------------------------------------------
 
         backtester = Backtester(
             candles=oos_candles,
@@ -373,116 +528,147 @@ def evaluate_oos(
         result = backtester.run()
 
         # ----------------------------------------------------
-        # OOS survival rules
-        #
-        # These are evaluated independently from TRAIN.
+        # OOS SURVIVAL GATES
         # ----------------------------------------------------
 
-        oos_survives = True
+        survives = True
 
-        reasons = []
+        rejection_reasons = []
 
         if result.total_trades < config.MIN_TRADES:
 
-            oos_survives = False
+            survives = False
 
-            reasons.append(
+            rejection_reasons.append(
                 "MIN_TRADES"
             )
 
         if result.win_rate < config.MIN_WIN_RATE:
 
-            oos_survives = False
+            survives = False
 
-            reasons.append(
+            rejection_reasons.append(
                 "WIN_RATE"
             )
 
         if result.max_drawdown > config.MAX_DRAWDOWN:
 
-            oos_survives = False
+            survives = False
 
-            reasons.append(
+            rejection_reasons.append(
                 "MAX_DRAWDOWN"
             )
 
-        if result.total_return <= MIN_OOS_RETURN:
+        if result.total_return <= config.MIN_OOS_RETURN:
 
-            oos_survives = False
+            survives = False
 
-            reasons.append(
+            rejection_reasons.append(
                 "OOS_RETURN"
             )
 
+        # ----------------------------------------------------
+        # Profit factor robustness gate
+        # ----------------------------------------------------
+
         if result.profit_factor <= 1.0:
 
-            oos_survives = False
+            survives = False
 
-            reasons.append(
+            rejection_reasons.append(
                 "PROFIT_FACTOR"
             )
+
+        # ----------------------------------------------------
+        # Rejection text
+        # ----------------------------------------------------
+
+        if rejection_reasons:
+
+            rejection_reason = ",".join(
+                rejection_reasons
+            )
+
+        else:
+
+            rejection_reason = ""
+
+        # ----------------------------------------------------
+        # PF display
+        # ----------------------------------------------------
+
+        if result.profit_factor == float(
+            "inf"
+        ):
+
+            pf_text = "INF"
+
+        else:
+
+            pf_text = (
+                f"{result.profit_factor:.2f}"
+            )
+
+        status = (
+            "OOS SURVIVES"
+            if survives
+            else "OOS DEAD"
+        )
 
         # ----------------------------------------------------
         # Store result
         # ----------------------------------------------------
 
-        result_row = OOSResult(
+        oos_result = OOSResult(
 
-            strategy_id=individual.strategy_id,
+            strategy_id=(
+                individual.strategy_id
+            ),
 
-            family=individual.genome.family,
+            family=(
+                individual.genome.family
+            ),
 
-            train_fitness=individual.fitness,
+            train_fitness=(
+                individual.fitness
+            ),
 
-            train_return=0.0,
+            oos_return=(
+                result.total_return
+            ),
 
-            train_drawdown=0.0,
+            oos_drawdown=(
+                result.max_drawdown
+            ),
 
-            train_win_rate=0.0,
+            oos_win_rate=(
+                result.win_rate
+            ),
 
-            train_profit_factor=0.0,
+            oos_profit_factor=(
+                result.profit_factor
+            ),
 
-            train_trades=0,
+            oos_trades=(
+                result.total_trades
+            ),
 
-            oos_return=result.total_return,
+            oos_survives=(
+                survives
+            ),
 
-            oos_drawdown=result.max_drawdown,
-
-            oos_win_rate=result.win_rate,
-
-            oos_profit_factor=result.profit_factor,
-
-            oos_trades=result.total_trades,
-
-            oos_survives=oos_survives,
+            rejection_reason=(
+                rejection_reason
+            ),
         )
 
         results.append(
-            result_row
+            oos_result
         )
 
         # ----------------------------------------------------
-        # Output
+        # Print
         # ----------------------------------------------------
-
-        pf_text = (
-            "INF"
-            if result.profit_factor == float("inf")
-            else f"{result.profit_factor:.2f}"
-        )
-
-        status = (
-            "OOS SURVIVES"
-            if oos_survives
-            else "OOS DEAD"
-        )
-
-        reason_text = (
-            ""
-            if oos_survives
-            else " | "
-            + ",".join(reasons)
-        )
 
         print(
             f"[{index:03d}/"
@@ -502,14 +688,18 @@ def evaluate_oos(
             f"Trades="
             f"{result.total_trades:4d} "
             f"{status}"
-            f"{reason_text}"
+            + (
+                f" [{rejection_reason}]"
+                if rejection_reason
+                else ""
+            )
         )
 
     return results
 
 
 # ============================================================
-# REPORT
+# FINAL OOS REPORT
 # ============================================================
 
 def print_oos_report(
@@ -525,11 +715,18 @@ def print_oos_report(
 
         print()
         print(
-            "No TRAIN survivors available "
-            "for OOS testing."
+            "No TRAIN survivors were available."
+        )
+
+        print(
+            "Therefore no OOS test was possible."
         )
 
         return
+
+    # --------------------------------------------------------
+    # OOS survivors
+    # --------------------------------------------------------
 
     survivors = [
         result
@@ -538,6 +735,7 @@ def print_oos_report(
     ]
 
     print()
+
     print(
         f"TRAIN survivors tested: "
         f"{len(results)}"
@@ -550,29 +748,18 @@ def print_oos_report(
 
     print()
 
-    # --------------------------------------------------------
-    # Best TRAIN fitness
-    # --------------------------------------------------------
+    # ========================================================
+    # BEST TRAIN FITNESS
+    # ========================================================
 
     best_train = max(
         results,
-        key=lambda x: x.train_fitness,
-    )
-
-    # --------------------------------------------------------
-    # Best OOS result
-    #
-    # This is only a REPORTING metric.
-    # It is NOT used to modify the population.
-    # --------------------------------------------------------
-
-    best_oos = max(
-        results,
-        key=lambda x: x.oos_return,
+        key=lambda result:
+        result.train_fitness,
     )
 
     print(
-        "Best TRAIN fitness:"
+        "Best TRAIN strategy:"
     )
 
     print(
@@ -581,8 +768,23 @@ def print_oos_report(
     )
 
     print(
+        f"  Family:   "
+        f"{best_train.family}"
+    )
+
+    print(
         f"  Fitness:  "
         f"{best_train.train_fitness:.4f}"
+    )
+
+    # ========================================================
+    # BEST OOS RETURN
+    # ========================================================
+
+    best_oos = max(
+        results,
+        key=lambda result:
+        result.oos_return,
     )
 
     print()
@@ -597,6 +799,11 @@ def print_oos_report(
     )
 
     print(
+        f"  Family:   "
+        f"{best_oos.family}"
+    )
+
+    print(
         f"  Return:   "
         f"{best_oos.oos_return * 100:.2f}%"
     )
@@ -607,20 +814,35 @@ def print_oos_report(
     )
 
     print(
-        f"  WR:       "
+        f"  Winrate:  "
         f"{best_oos.oos_win_rate * 100:.2f}%"
     )
 
+    if best_oos.oos_profit_factor == float(
+        "inf"
+    ):
+
+        print(
+            "  PF:       INF"
+        )
+
+    else:
+
+        print(
+            f"  PF:       "
+            f"{best_oos.oos_profit_factor:.2f}"
+        )
+
     print(
-        f"  PF:       "
-        f"{best_oos.oos_profit_factor}"
+        f"  Trades:   "
+        f"{best_oos.oos_trades}"
     )
 
     print()
 
-    # --------------------------------------------------------
-    # OOS survivors
-    # --------------------------------------------------------
+    # ========================================================
+    # OOS SURVIVORS
+    # ========================================================
 
     print("=" * 70)
     print("OOS SURVIVORS")
@@ -634,17 +856,26 @@ def print_oos_report(
 
     else:
 
-        for result in sorted(
+        sorted_survivors = sorted(
             survivors,
-            key=lambda x: x.oos_return,
+            key=lambda result:
+            result.oos_return,
             reverse=True,
-        ):
+        )
 
-            pf_text = (
-                "INF"
-                if result.oos_profit_factor == float("inf")
-                else f"{result.oos_profit_factor:.2f}"
-            )
+        for result in sorted_survivors:
+
+            if result.oos_profit_factor == float(
+                "inf"
+            ):
+
+                pf_text = "INF"
+
+            else:
+
+                pf_text = (
+                    f"{result.oos_profit_factor:.2f}"
+                )
 
             print(
                 f"{result.strategy_id:<12} "
@@ -656,14 +887,16 @@ def print_oos_report(
                 f"WR="
                 f"{result.oos_win_rate * 100:6.2f}% "
                 f"PF="
-                f"{pf_text}"
+                f"{pf_text:>6} "
+                f"Trades="
+                f"{result.oos_trades}"
             )
 
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # Family statistics
-    # --------------------------------------------------------
+    # ========================================================
+    # FAMILY ANALYSIS
+    # ========================================================
 
     print()
     print("OOS FAMILY RESULTS")
@@ -673,28 +906,90 @@ def print_oos_report(
 
     for result in results:
 
-        if result.family not in families:
+        family = result.family
 
-            families[result.family] = {
+        if family not in families:
+
+            families[family] = {
                 "tested": 0,
                 "survived": 0,
             }
 
-        families[result.family]["tested"] += 1
+        families[family]["tested"] += 1
 
         if result.oos_survives:
 
-            families[result.family]["survived"] += 1
+            families[family]["survived"] += 1
 
-    for family, stats in sorted(
-        families.items()
+    for family in sorted(
+        families.keys()
     ):
+
+        stats = families[family]
 
         print(
             f"{family:<24} "
-            f"tested={stats['tested']:3d} "
-            f"survived={stats['survived']:3d}"
+            f"tested="
+            f"{stats['tested']:3d} "
+            f"survived="
+            f"{stats['survived']:3d}"
         )
+
+    print("=" * 70)
+
+    # ========================================================
+    # GENERALIZATION RATE
+    # ========================================================
+
+    print()
+
+    train_count = len(
+        results
+    )
+
+    oos_count = len(
+        survivors
+    )
+
+    if train_count > 0:
+
+        generalization_rate = (
+            oos_count
+            / train_count
+        )
+
+    else:
+
+        generalization_rate = 0.0
+
+    print(
+        "TRAIN → OOS GENERALIZATION"
+    )
+
+    print(
+        f"TRAIN survivors: "
+        f"{train_count}"
+    )
+
+    print(
+        f"OOS survivors:   "
+        f"{oos_count}"
+    )
+
+    print(
+        f"Survival rate:   "
+        f"{generalization_rate * 100:.2f}%"
+    )
+
+    print()
+
+    print(
+        "This percentage is descriptive only."
+    )
+
+    print(
+        "It is NOT used to modify the strategy population."
+    )
 
     print("=" * 70)
 
@@ -707,35 +1002,53 @@ def main():
 
     print()
     print("=" * 70)
-    print("EVOLUTION TRADER - WALK FORWARD TEST")
+    print("EVOLUTION TRADER")
+    print("70/30 WALK-FORWARD OOS TEST")
     print("=" * 70)
 
     print(
-        f"Symbol:       {config.SYMBOL}"
+        f"Symbol:       "
+        f"{config.SYMBOL}"
     )
 
     print(
-        f"Timeframe:    {config.TIMEFRAME}"
+        f"Timeframe:    "
+        f"{config.TIMEFRAME}"
     )
 
     print(
-        f"Train split:  {TRAIN_PERCENT * 100:.0f}%"
+        f"Data:         "
+        f"{DATA_DAYS} days"
     )
 
     print(
-        f"OOS split:    {OOS_PERCENT * 100:.0f}%"
+        f"Train:        "
+        f"{TRAIN_PERCENT * 100:.0f}%"
     )
 
     print(
-        f"Generations:  {EVOLUTION_GENERATIONS}"
+        f"OOS:          "
+        f"{OOS_PERCENT * 100:.0f}%"
     )
 
     print(
-        f"Population:   {config.POPULATION_SIZE}"
+        f"Population:   "
+        f"{config.POPULATION_SIZE}"
     )
 
     print(
-        "Mode:         PAPER / BACKTEST ONLY"
+        f"Generations:  "
+        f"{EVOLUTION_GENERATIONS}"
+    )
+
+    print(
+        "Mode:         "
+        "PAPER / BACKTEST ONLY"
+    )
+
+    print(
+        "Live trading: "
+        "DISABLED"
     )
 
     print("=" * 70)
@@ -744,13 +1057,11 @@ def main():
     # LOAD DATA
     # ========================================================
 
+    candles = load_market_data()
+
     print()
-    print("Loading market data...")
-
-    candles = load_candles()
-
     print(
-        f"Loaded candles: "
+        f"Total candles loaded: "
         f"{len(candles)}"
     )
 
@@ -759,7 +1070,9 @@ def main():
     # ========================================================
 
     train_candles, oos_candles = (
-        split_data(candles)
+        split_data(
+            candles
+        )
     )
 
     print()
@@ -784,22 +1097,14 @@ def main():
         f"({OOS_PERCENT * 100:.0f}%)"
     )
 
-    print()
-
-    print(
-        "TRAIN and OOS are strictly chronological."
-    )
-
-    print(
-        "OOS data will not influence evolution."
-    )
-
     # ========================================================
-    # EVOLUTION
+    # TRAIN
     # ========================================================
 
-    final_population = evolve_on_train(
-        train_candles
+    final_population = (
+        evolve_on_train(
+            train_candles
+        )
     )
 
     # ========================================================
@@ -829,26 +1134,27 @@ def main():
     print("=" * 70)
 
     print(
-        f"TRAIN candles: "
+        f"TRAIN candles:     "
         f"{len(train_candles)}"
     )
 
     print(
-        f"OOS candles:   "
+        f"OOS candles:       "
         f"{len(oos_candles)}"
     )
 
     print(
-        f"TRAIN survivors: "
+        f"TRAIN survivors:   "
         f"{len(final_population.survivors())}"
     )
 
     print(
-        f"OOS survivors:   "
-        f"{sum(1 for x in oos_results if x.oos_survives)}"
+        f"OOS survivors:     "
+        f"{sum(1 for result in oos_results if result.oos_survives)}"
     )
 
     print()
+
     print(
         "NO LIVE TRADING"
     )

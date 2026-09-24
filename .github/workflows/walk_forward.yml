@@ -1,0 +1,39 @@
+name: Evolution Trader - Walk Forward OOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  walk-forward:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Repository check
+        run: |
+          echo "=============================================="
+          echo "EVOLUTION TRADER - WALK FORWARD"
+          echo "=============================================="
+          python --version
+          echo
+          echo "Files:"
+          ls -la
+          echo
+          echo "Walk-forward test starting..."
+          echo "=============================================="
+
+      - name: Run Walk Forward OOS Test
+        run: |
+          python walk_forward.py
